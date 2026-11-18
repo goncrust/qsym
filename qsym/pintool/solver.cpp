@@ -1,6 +1,12 @@
+#include <cstdio>
+#include <cstring>
+#include <cstdlib>
 #include <set>
 #include <byteswap.h>
 #include "solver.h"
+
+// the program's own code, from the loader (Runtime.cpp)
+extern "C" uintptr_t _sym_code_lo, _sym_code_hi;
 
 namespace qsym {
 
@@ -105,6 +111,148 @@ Solver::Solver(
 
   checkOutDir();
   readInput();
+
+  if (const char* path = getenv("SYMCC_FRONTIER_FILE")) {
+    frontier_fp_ = fopen(path, "a");
+    if (!frontier_fp_)
+      LOG_FATAL("Unable to open the frontier file\n");
+  }
+
+  const char* only = getenv("SYMCC_FRONTIER_ONLY");
+  frontier_only_ = frontier_fp_ && only && strcmp(only, "0") != 0;
+
+  const char* all = getenv("SYMCC_FRONTIER_ALL");
+  frontier_all_ = all && strcmp(all, "0") != 0;
+
+  const char* blocks = getenv("SYMCC_BLOCKS");
+  blocks_on_ = frontier_fp_ && blocks && strcmp(blocks, "0") != 0;
+
+  if (const char* range = getenv("SYMCC_BLOCK_RANGE")) {
+    unsigned long lo = 0, hi = 0;
+    if (frontier_fp_ && sscanf(range, "%lx-%lx", &lo, &hi) == 2 && lo < hi) {
+      blocks_on_ = true;
+      blocks_lo_ = lo;
+      blocks_hi_ = hi;
+    }
+  }
+}
+
+void Solver::exportBranch(ExprRef e, bool taken, ADDRINT pc, bool is_interesting) {
+  reset();
+  syncConstraints(e);
+  addToSolver(e, !taken);
+
+  frontier_pending_.push_back({current_block_ ? current_block_ : pc, taken, is_interesting,
+                               (unsigned)solver_.assertions().size(),
+                               exportAsserts(), constraints_});
+}
+
+std::string Solver::exportAsserts() {
+  z3::expr_vector as = solver_.assertions();
+  std::string ids;
+  char buf[32];
+  long run_lo = -1, run_hi = -1;
+
+  auto close_run = [&]() {
+    if (run_lo < 0)
+      return;
+
+    if (run_lo == run_hi)
+      snprintf(buf, sizeof(buf), "%s%ld", ids.empty() ? "" : ",", run_lo);
+    else
+      snprintf(buf, sizeof(buf), "%s%ld-%ld", ids.empty() ? "" : ",", run_lo, run_hi);
+
+    ids += buf;
+  };
+
+  for (unsigned i = 0; i < as.size(); i++) {
+    z3::expr a = as[i];
+    unsigned ast = Z3_get_ast_id(a.ctx(), a);
+    auto it = assert_ids_.find(ast);
+    uint32_t id;
+
+    if (it != assert_ids_.end()) {
+      id = it->second;
+    } else {
+      id = assert_pinned_.size();
+      assert_pinned_.push_back(a);
+      assert_ids_[ast] = id;
+      std::string smt =
+          Z3_benchmark_to_smtlib_string(a.ctx(), "", "", "unknown", "", 0, nullptr, a);
+      fprintf(frontier_fp_, "#ASSERT id=%u len=%zu\n", id, smt.size());
+      fwrite(smt.data(), 1, smt.size(), frontier_fp_);
+      fputc('\n', frontier_fp_);
+    }
+
+    if (run_lo >= 0 && (long)id == run_hi + 1) {
+      run_hi++;
+    } else {
+      close_run();
+      run_lo = run_hi = id;
+    }
+  }
+
+  close_run();
+  return ids;
+}
+
+void Solver::noteJcc(ADDRINT at, ADDRINT jump, ADDRINT fall) {
+  jcc_ = {at, jump, fall, constraints_, true};
+}
+
+void Solver::noteBlock(ADDRINT pc) {
+  current_block_ = pc;
+
+  if (!frontier_pending_.empty())
+    flushFrontier(pc);
+  jcc_.valid = false;
+
+  if (!blocks_on_)
+    return;
+
+  if (!blocks_hi_ && _sym_code_hi) {
+    blocks_lo_ = _sym_code_lo;
+    blocks_hi_ = _sym_code_hi;
+  }
+
+  // blocks_seen_.insert(pc).second is false if pc already existed in the set
+  if (blocks_hi_ && pc >= blocks_lo_ && pc < blocks_hi_ && blocks_seen_.insert(pc).second) {
+    char buf[24];
+    int n = snprintf(buf, sizeof(buf), "%lx", (unsigned long)pc);
+    fprintf(frontier_fp_, "#BLOCKS len=%d\n%s\n", n, buf);
+    fflush(frontier_fp_);
+  }
+}
+
+void Solver::flushFrontier(ADDRINT pc) {
+  for (size_t i = 0; i < frontier_pending_.size(); i++) {
+    const PendingBranch& b = frontier_pending_[i];
+    char br[80] = " kind=cond";
+
+    /* Necessary conditions so that this represents a jcc (kind=brcond):
+      - the block that just ended ran a conditional jump
+      - this is the block's last record
+      - nothing symbolic was pushed after this condition, exported or not
+      - the condition was pushed after the jump was announced
+      - execution continued at one of the jump's two desticantions
+    */
+    if (jcc_.valid && i + 1 == frontier_pending_.size() && b.id == constraints_ &&
+        b.id > jcc_.after && (pc == jcc_.jump || pc == jcc_.fall))
+      snprintf(br, sizeof(br), " kind=br branch=0x%lx target=0x%lx", (unsigned long)jcc_.at,
+               (unsigned long)(pc == jcc_.jump ? jcc_.fall : jcc_.jump));
+
+    fprintf(frontier_fp_,
+            "#FRONTIER seq=%lu pc=0x%lx taken=%d interesting=%d n=%u succ=0x%lx last=%d%s len=%zu\n",
+            (unsigned long)frontier_seq_++, (unsigned long)b.pc, b.taken ? 1 : 0,
+            b.interesting ? 1 : 0, b.n, (unsigned long)pc,
+            i + 1 == frontier_pending_.size() ? 1 : 0, br, b.asserts.size());
+
+    fwrite(b.asserts.data(), 1, b.asserts.size(), frontier_fp_);
+    fputc('\n', frontier_fp_);
+  }
+
+  fflush(frontier_fp_);
+  frontier_pending_.clear();
 }
 
 void Solver::push() {
@@ -171,6 +319,7 @@ void Solver::addJcc(ExprRef e, bool taken, ADDRINT pc) {
   }
 
   assert(isRelational(e.get()));
+  constraints_++;
 
   // check duplication before really solving something,
   // some can be handled by range based constraint solving
@@ -182,8 +331,12 @@ void Solver::addJcc(ExprRef e, bool taken, ADDRINT pc) {
   else
     is_interesting = isInterestingJcc(e, taken, pc);
 
-  if (is_interesting)
+  if (frontier_fp_ && pc != 0 && (is_interesting || frontier_all_))
+    exportBranch(e, taken, pc, is_interesting);
+
+  if (is_interesting && !frontier_only_)
     negatePath(e, taken);
+
   addConstraint(e, taken, is_interesting);
 }
 
@@ -196,7 +349,7 @@ void Solver::addAddr(ExprRef e, llvm::APInt addr) {
   if (e->isConcrete())
     return;
 
-  if (last_interested_) {
+  if (last_interested_ && !frontier_only_) {
     reset();
     // TODO: add optimize in z3
     syncConstraints(e);
@@ -234,7 +387,7 @@ void Solver::addValue(ExprRef e, llvm::APInt val) {
 }
 
 void Solver::solveAll(ExprRef e, llvm::APInt val) {
-  if (last_interested_) {
+  if (last_interested_ && !frontier_only_) {
     std::string postfix = "";
     ExprRef expr_val = g_expr_builder->createConstant(val, e->bits());
     ExprRef expr_concrete = g_expr_builder->createBinaryExpr(Equal, e, expr_val);
