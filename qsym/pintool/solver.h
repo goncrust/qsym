@@ -56,6 +56,11 @@ public:
   // a conditional jump at `at` will go to `jump` or `fall`
   void noteJcc(ADDRINT at, ADDRINT jump, ADDRINT fall);
 
+  // a call, or a return, identified by the call's return address (the address
+  // after the call instruction, where the matching return goes)
+  void noteCall(ADDRINT ret_addr);
+  void noteRet(ADDRINT ret_addr);
+
 protected:
   std::string input_file_;
   std::vector<UINT8> inputs_;
@@ -96,6 +101,10 @@ protected:
   bool blocks_on_ = false;
   ADDRINT blocks_lo_ = 0, blocks_hi_ = 0;
   std::unordered_set<ADDRINT> blocks_seen_;
+
+  bool calls_on_ = false;
+  std::string calls_deferred_; // #CALL/#RET records waiting for their block's branch records
+  void exportCall(const char* kind, ADDRINT ret_addr);
 
   uint64_t constraints_ = 0;
   struct {

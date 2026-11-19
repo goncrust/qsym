@@ -127,6 +127,9 @@ Solver::Solver(
   const char* blocks = getenv("SYMCC_BLOCKS");
   blocks_on_ = frontier_fp_ && blocks && strcmp(blocks, "0") != 0;
 
+  const char* calls = getenv("SYMCC_CALLS");
+  calls_on_ = frontier_fp_ && calls && strcmp(calls, "0") != 0;
+
   if (const char* range = getenv("SYMCC_BLOCK_RANGE")) {
     unsigned long lo = 0, hi = 0;
     if (frontier_fp_ && sscanf(range, "%lx-%lx", &lo, &hi) == 2 && lo < hi) {
@@ -251,8 +254,34 @@ void Solver::flushFrontier(ADDRINT pc) {
     fputc('\n', frontier_fp_);
   }
 
+  fputs(calls_deferred_.c_str(), frontier_fp_);
+  calls_deferred_.clear();
+
   fflush(frontier_fp_);
   frontier_pending_.clear();
+}
+
+void Solver::noteCall(ADDRINT ret_addr) {
+  exportCall("CALL", ret_addr);
+}
+
+void Solver::noteRet(ADDRINT ret_addr) {
+  exportCall("RET", ret_addr);
+}
+
+void Solver::exportCall(const char* kind, ADDRINT ret_addr) {
+  if (!calls_on_ || ret_addr < _sym_code_lo || ret_addr >= _sym_code_hi)
+    return;
+
+  char addr[24];
+  int n = snprintf(addr, sizeof(addr), "%lx", (unsigned long)ret_addr);
+  char rec[64];
+  snprintf(rec, sizeof(rec), "#%s len=%d\n%s\n", kind, n, addr);
+
+  if (frontier_pending_.empty())
+    fputs(rec, frontier_fp_);
+  else
+    calls_deferred_ += rec;
 }
 
 void Solver::push() {
